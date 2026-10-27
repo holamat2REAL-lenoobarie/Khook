@@ -1,0 +1,259 @@
+if LPH_OBFUSCATED == nil then
+    local assert = assert
+    local type = type
+    local setfenv = setfenv
+    LPH_ENCNUM = function(toEncrypt, ...)
+        assert(type(toEncrypt) == "number" and #{...} == 0, "LPH_ENCNUM only accepts a single constant double or integer as an argument.")
+        return toEncrypt
+    end
+    LPH_NUMENC = LPH_ENCNUM
+    LPH_ENCSTR = function(toEncrypt, ...)
+        assert(type(toEncrypt) == "string" and #{...} == 0, "LPH_ENCSTR only accepts a single constant string as an argument.")
+        return toEncrypt
+    end
+    LPH_STRENC = LPH_ENCSTR
+    LPH_ENCFUNC = function(toEncrypt, encKey, decKey, ...)
+        assert(type(toEncrypt) == "function" and type(encKey) == "string" and #{...} == 0, "LPH_ENCFUNC accepts a constant function, constant string, and string variable as arguments.")
+        return toEncrypt
+    end
+    LPH_FUNCENC = LPH_ENCFUNC
+    LPH_JIT = function(f, ...)
+        assert(type(f) == "function" and #{...} == 0, "LPH_JIT only accepts a single constant function as an argument.")
+        return f
+    end
+    LPH_JIT_MAX = LPH_JIT
+    LPH_NO_VIRTUALIZE = function(f, ...)
+        assert(type(f) == "function" and #{...} == 0, "LPH_NO_VIRTUALIZE only accepts a single constant function as an argument.")
+        return f
+    end
+    LPH_NO_UPVALUES = function(f, ...)
+        assert(type(setfenv) == "function", "LPH_NO_UPVALUES can only be used on Lua versions with getfenv & setfenv")
+        assert(type(f) == "function" and #{...} == 0, "LPH_NO_UPVALUES only accepts a single constant function as an argument.")
+        local env = (getrenv and getrenv()) or _G
+        return setfenv(
+            LPH_NO_VIRTUALIZE(function(...)
+                return func(...)
+            end),
+            setmetatable({ func = f }, { __index = env, __newindex = env })
+        )
+    end
+    LPH_CRASH = function(...)
+        return print(debug.traceback())
+    end
+end
+
+local AT_MODE = "enforce"
+
+local AT = { violations = 0, armed = true }
+
+do
+    local _pcall       = pcall
+    local _type        = type
+    local _tostring    = tostring
+    local _rawget      = rawget
+    local _rawequal    = rawequal
+    local _select      = select
+    local _error       = error
+    local _string_fmt  = string.format
+    local _os_time     = os.time
+    local _math_random = math.random
+    local _next        = next
+    local _pairs       = pairs
+    local _getfenv     = getfenv
+    local _setfenv     = setfenv
+
+    local _env  = (_getfenv and _getfenv(0)) or _G
+    local _dbg  = _rawget(_env, "debug") or _rawget(_G, "debug")
+    local _getinfo      = _dbg and _dbg.getinfo
+    local _getupvalue   = _dbg and _dbg.getupvalue
+    local _getupvalues  = _dbg and _dbg.getupvalues
+    local _getconstants = _dbg and _dbg.getconstants
+    local _getproto     = _dbg and _dbg.getproto
+    local _getprotos    = _dbg and _dbg.getprotos
+    local _sethook      = _dbg and _dbg.sethook
+    local _gethook      = _dbg and _dbg.gethook
+
+    local CRITICAL = {
+        ["pcall"]             = _pcall,
+        ["type"]              = _type,
+        ["tostring"]          = _tostring,
+        ["rawget"]            = _rawget,
+        ["rawequal"]          = _rawequal,
+        ["select"]            = _select,
+        ["error"]             = _error,
+        ["string.format"]     = _string_fmt,
+        ["os.time"]           = _os_time,
+        ["math.random"]       = _math_random,
+        ["debug.getinfo"]     = _getinfo,
+        ["debug.getupvalue"]  = _getupvalue,
+        ["debug.getupvalues"] = _getupvalues,
+        ["debug.getconstants"]= _getconstants,
+        ["debug.getproto"]    = _getproto,
+        ["debug.getprotos"]   = _getprotos,
+        ["debug.sethook"]     = _sethook,
+        ["debug.gethook"]     = _gethook,
+    }
+
+    local function fingerprint(fn)
+        if _type(fn) ~= "function" then return "nil" end
+        if not _getinfo then return "noinfo:" .. _tostring(fn) end
+        local ok, info = _pcall(_getinfo, fn, "S")
+        if not ok or _type(info) ~= "table" then
+            return "noinfo:" .. _tostring(fn)
+        end
+        return _string_fmt(
+            "%s|%s|%s|%s|%s",
+            _tostring(info.source),
+            _tostring(info.linedefined),
+            _tostring(info.lastlinedefined),
+            _tostring(info.nparams),
+            _tostring(info.is_vararg)
+        )
+    end
+
+    local BASELINE = {}
+    for name, fn in _pairs(CRITICAL) do
+        BASELINE[name] = fingerprint(fn)
+    end
+
+    local function punish()
+        if AT_MODE == "log" then
+            AT.violations = AT.violations + 1
+            return
+        end
+        AT.armed = false
+        _error("tamper detected", 0)
+    end
+
+    local function check()
+        if not AT.armed then return true end
+        for name, fn in _pairs(CRITICAL) do
+            local current = fingerprint(fn)
+            if current ~= BASELINE[name] then
+                punish()
+                return false
+            end
+        end
+        return true
+    end
+
+    local function checkHook()
+        if not _gethook then return true end
+        local ok, mask, count, fn = _pcall(_gethook)
+        if not ok then
+            punish()
+            return false
+        end
+        if mask ~= nil and mask ~= "" then
+            punish()
+            return false
+        end
+        if fn ~= nil then
+            punish()
+            return false
+        end
+        if count ~= nil and count ~= 0 then
+            punish()
+            return false
+        end
+        return true
+    end
+
+    local function checkEnv()
+        if not _getfenv then return true end
+        local ok, env = _pcall(_getfenv, 0)
+        if not ok or _type(env) ~= "table" then
+            punish()
+            return false
+        end
+        if env ~= _env then
+            punish()
+            return false
+        end
+        return true
+    end
+
+    local function checkRequire()
+        local ok, req = _pcall(function() return require end)
+        if not ok then return true end
+        if _type(req) ~= "function" then
+            punish()
+            return false
+        end
+        return true
+    end
+
+    local function checkLoadstring()
+        local ok, ls = _pcall(function() return loadstring end)
+        if not ok then return true end
+        if ls == nil then return true end
+        local ok2, f = _pcall(ls, "return 1")
+        if not ok2 or _type(f) ~= "function" then
+            punish()
+            return false
+        end
+        local ok3, n = _pcall(f)
+        if not ok3 or n ~= 1 then
+            punish()
+            return false
+        end
+        return true
+    end
+
+    local function runAll()
+        if not check() then return false end
+        if not checkHook() then return false end
+        if not checkEnv() then return false end
+        if not checkRequire() then return false end
+        if not checkLoadstring() then return false end
+        return true
+    end
+
+    AT.runAll   = runAll
+    AT.check    = check
+    AT.checkHook= checkHook
+    AT.checkEnv = checkEnv
+    AT.fingerprint = fingerprint
+
+    AT.runAll()
+
+    local base = _os_time()
+    local seq  = 0
+    local function tick()
+        seq = seq + 1
+        local now = _os_time()
+        if now - base > 2 then
+            base = now
+            AT.runAll()
+            return
+        end
+        if seq % 97 == 0 then
+            AT.runAll()
+        end
+    end
+    AT.tick = tick
+
+    local wrap = function(orig)
+        return function(...)
+            tick()
+            return orig(...)
+        end
+    end
+
+    AT.wrap = wrap
+end
+
+LPH_ENCNUM       = AT.wrap(LPH_ENCNUM)
+LPH_NUMENC       = AT.wrap(LPH_NUMENC)
+LPH_ENCSTR       = AT.wrap(LPH_ENCSTR)
+LPH_STRENC       = AT.wrap(LPH_STRENC)
+LPH_ENCFUNC      = AT.wrap(LPH_ENCFUNC)
+LPH_FUNCENC      = AT.wrap(LPH_FUNCENC)
+LPH_JIT          = AT.wrap(LPH_JIT)
+LPH_JIT_MAX      = AT.wrap(LPH_JIT_MAX)
+LPH_NO_VIRTUALIZE= AT.wrap(LPH_NO_VIRTUALIZE)
+LPH_NO_UPVALUES  = AT.wrap(LPH_NO_UPVALUES)
+
+AT.runAll()
+
+return AT
